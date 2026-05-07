@@ -244,7 +244,14 @@ import {
   formatCommandInputTags,
 } from '../utils/messages.js';
 import { generateSessionTitle } from '../utils/sessionTitle.js';
-import { BASH_INPUT_TAG, COMMAND_MESSAGE_TAG, COMMAND_NAME_TAG, LOCAL_COMMAND_STDOUT_TAG } from '../constants/xml.js';
+import {
+  BASH_INPUT_TAG,
+  COMMAND_MESSAGE_TAG,
+  COMMAND_NAME_TAG,
+  FORK_BOILERPLATE_TAG,
+  LOCAL_COMMAND_STDOUT_TAG,
+} from '../constants/xml.js';
+import { FORK_SUBAGENT_TYPE } from '@claude-code-best/builtin-tools/tools/AgentTool/forkSubagent.js';
 import { escapeXml } from '../utils/xml.js';
 import type { ThinkingConfig } from '../utils/thinking.js';
 import { gracefulShutdownSync } from '../utils/gracefulShutdown.js';
@@ -270,7 +277,7 @@ import { useManagePlugins } from '../hooks/useManagePlugins.js';
 import { Messages } from '../components/Messages.js';
 import { TaskListV2 } from '../components/TaskListV2.js';
 import { TeammateViewHeader } from '../components/TeammateViewHeader.js';
-import { getPipeDisplayRole, getPipeIpc, isPipeControlled } from '../utils/pipeTransport.js';
+import { getPipeIpc } from '../utils/pipeTransport.js';
 import { useTasksV2WithCollapseEffect } from '../hooks/useTasksV2.js';
 import { maybeMarkProjectOnboardingComplete } from '../projectOnboardingState.js';
 import type { MCPServerConnection } from '../services/mcp/types.js';
@@ -336,6 +343,7 @@ import {
 import { isBgSession, updateSessionName, updateSessionActivity } from '../utils/concurrentSessions.js';
 import { isInProcessTeammateTask, type InProcessTeammateTaskState } from '../tasks/InProcessTeammateTask/types.js';
 import { restoreRemoteAgentTasks } from '../tasks/RemoteAgentTask/RemoteAgentTask.js';
+import { BackgroundAgentSelector } from '../components/tasks/BackgroundAgentSelector.js';
 import { useInboxPoller } from '../hooks/useInboxPoller.js';
 // Dead code elimination: conditional import for loop mode
 /* eslint-disable @typescript-eslint/no-require-imports */
@@ -800,6 +808,21 @@ export type Props = {
 
 export type Screen = 'prompt' | 'transcript';
 
+// Boilerplate carrier lives in a mixed user message ([tool_result..., text])
+// that AgentTool/forkSubagent.buildForkedMessages emits as the fork child's
+// first user turn. The text block wraps <FORK_BOILERPLATE_TAG>...</..> + the
+// user prompt; tool_result siblings keep the parent's tool calls closed.
+const FORK_BOILERPLATE_OPEN_TAG = `<${FORK_BOILERPLATE_TAG}>`;
+
+function isForkBoilerplateTextBlock(block: { type: string; text?: string }): boolean {
+  return block.type === 'text' && typeof block.text === 'string' && block.text.includes(FORK_BOILERPLATE_OPEN_TAG);
+}
+
+function isForkBoilerplateMessage(message: MessageType): boolean {
+  if (message.type !== 'user' || !Array.isArray(message.message?.content)) return false;
+  return message.message.content.some(isForkBoilerplateTextBlock);
+}
+
 export function REPL({
   commands: initialCommands,
   debug,
@@ -808,8 +831,8 @@ export function REPL({
   pendingHookMessages,
   initialFileHistorySnapshots,
   initialContentReplacements,
-  initialAgentName,
-  initialAgentColor,
+  initialAgentName: _initialAgentName,
+  initialAgentColor: _initialAgentColor,
   mcpClients: initialMcpClients,
   dynamicMcpConfig: initialDynamicMcpConfig,
   autoConnectIdeFlag,
@@ -2797,7 +2820,7 @@ export function REPL({
   const getToolUseContext = useCallback(
     (
       messages: MessageType[],
-      newMessages: MessageType[],
+      _newMessages: MessageType[],
       abortController: AbortController,
       mainLoopModel: string,
     ): ProcessUserInputContext => {
@@ -4937,7 +4960,7 @@ export function REPL({
   useMailboxBridge({ isLoading, onSubmitMessage: handleIncomingPrompt });
   useMasterMonitor();
   useSlaveNotifications();
-  const pipeIpcState = useAppState(s => getPipeIpc(s as any));
+  const _pipeIpcState = useAppState(s => getPipeIpc(s as any));
 
   usePipePermissionForward({ store, tools, setMessages, setToolUseConfirmQueue, getToolUseContext, mainLoopModel });
   usePipeMuteSync({ setToolUseConfirmQueue });
@@ -5548,8 +5571,72 @@ export function REPL({
   const usesSyncMessages = showStreamingText || !isLoading;
   // When viewing an agent, never fall through to leader — empty until
   // bootstrap/stream fills. Closes the see-leader-type-agent footgun.
+  const rawAgentMessages = viewedAgentTask?.messages;
+  // Fork sidechain encodes the user prompt inside a mixed user message alongside
+  // tool_result blocks; surface the prompt as a standalone bubble and strip the
+  // boilerplate text from its original carrier while preserving tool_results.
+  const displayedAgentMessages = useMemo(() => {
+    if (!viewedAgentTask) return undefined;
+    const agentMessages = rawAgentMessages ?? [];
+    if (
+      !isLocalAgentTask(viewedAgentTask) ||
+      viewedAgentTask.agentType !== FORK_SUBAGENT_TYPE ||
+      !viewedAgentTask.prompt
+    ) {
+      return agentMessages;
+    }
+    // Single pass: locate boilerplate carrier, check whether the prompt text is
+    // already present elsewhere, and find the fallback insertion point (after
+    // the last parent assistant tool_use).
+    const trimmedPrompt = viewedAgentTask.prompt.trim();
+    let boilerplateIndex = -1;
+    let lastAssistantToolUseIndex = -1;
+    let promptAlreadyRendered = false;
+    for (let i = 0; i < agentMessages.length; i++) {
+      const m = agentMessages[i]!;
+      if (m.type === 'user' && Array.isArray(m.message?.content)) {
+        const hasBoilerplate = m.message.content.some(isForkBoilerplateTextBlock);
+        if (hasBoilerplate) {
+          boilerplateIndex = i;
+        } else if (!promptAlreadyRendered) {
+          const firstText = m.message.content.find(b => b.type === 'text' && typeof b.text === 'string') as
+            | { type: 'text'; text: string }
+            | undefined;
+          if (firstText && firstText.text.trim() === trimmedPrompt) promptAlreadyRendered = true;
+        }
+        continue;
+      }
+      if (m.type === 'assistant' && Array.isArray(m.message?.content)) {
+        if (m.message.content.some(b => b.type === 'tool_use')) lastAssistantToolUseIndex = i;
+      }
+    }
+
+    const stripped =
+      boilerplateIndex === -1
+        ? agentMessages
+        : agentMessages.map((m, i) => {
+            if (i !== boilerplateIndex) return m;
+            if (!Array.isArray(m.message?.content)) return m;
+            return {
+              ...m,
+              message: {
+                ...m.message,
+                content: m.message.content.filter(b => !isForkBoilerplateTextBlock(b)),
+              },
+            };
+          });
+
+    if (promptAlreadyRendered) return stripped;
+
+    const insertAt = boilerplateIndex !== -1 ? boilerplateIndex + 1 : lastAssistantToolUseIndex + 1;
+    const synthetic = createUserMessage({
+      content: viewedAgentTask.prompt,
+      timestamp: new Date(viewedAgentTask.startTime).toISOString(),
+    });
+    return [...stripped.slice(0, insertAt), synthetic, ...stripped.slice(insertAt)];
+  }, [viewedAgentTask, rawAgentMessages]);
   const displayedMessages = viewedAgentTask
-    ? (viewedAgentTask.messages ?? [])
+    ? (displayedAgentMessages ?? [])
     : usesSyncMessages
       ? messages
       : deferredMessages;
@@ -6286,6 +6373,7 @@ export function REPL({
                       voiceInterimRange={voice.interimRange}
                     />
                     <SessionBackgroundHint onBackgroundSession={handleBackgroundSession} isLoading={isLoading} />
+                    <BackgroundAgentSelector />
                   </>
                 )}
                 {cursor && (
